@@ -32,11 +32,14 @@ function makeInternal(gen, { keys = [], children = [] } = {}) {
 }
 
 // 在不可变快照 src(id->page) 上产出一批新版本页。
+// trace 记录本批次过程中的结构事件（分裂 / 借位 / 合并 / 根提升或收缩），
+// 仅供预演逐项汇报，不参与页内容与 id 派生。
 class Writer {
   constructor(src, gen) {
     this.src = src;
     this.gen = gen;
     this.out = new Map();
+    this.trace = [];
   }
   get(id) {
     if (id == null) throw new Error('引用了空页 id');
@@ -80,6 +83,7 @@ class Writer {
       const mid = 2;
       const rightId = this.leaf(keys.slice(mid), values.slice(mid));
       const leftId = this.leaf(keys.slice(0, mid), values.slice(0, mid));
+      this.ev('leaf-split', { atKey: key, sepKey: keys[mid], leftId, rightId });
       return { split: true, key: keys[mid], left: leftId, right: rightId };
     }
 
@@ -109,7 +113,13 @@ class Writer {
       keys: keys.slice(3),
       children: children.slice(3),
     }));
+    this.ev('internal-split', { atKey: key, sepKey: promote, leftId, rightId });
     return { split: true, key: promote, left: leftId, right: rightId };
+  }
+
+  // 追加一条结构事件（供预演展示）；事件只描述结果，不影响任何页的内容寻址
+  ev(kind, detail) {
+    this.trace.push({ kind, ...detail });
   }
 
   // 删除：返回 { id, underflow }。underflow 供父节点处理（叶子空 / 内部仅1子）。
@@ -136,12 +146,13 @@ class Writer {
     children[idx] = r.id;
 
     if (r.underflow) {
-      ({ keys, children } = this.fixUnderflow(keys, children, idx, child.type));
+      ({ keys, children } = this.fixUnderflow(keys, children, idx, child.type, key));
     }
 
     if (children.length < MIN_CHILDREN) {
       if (isRoot) {
         // 根收缩：唯一子节点直接成为新根
+        this.ev('root-shrink', { atKey: key, childId: children[0] });
         return { id: children[0], underflow: false };
       }
       return { id: this.emit(this.copy(node, { keys, children })), underflow: true };
@@ -150,7 +161,7 @@ class Writer {
   }
 
   // 修正 children[fixIdx] 的下溢：借位或合并。返回新的 { keys, children }（新版本均已 emit）。
-  fixUnderflow(keys, children, fixIdx, childType) {
+  fixUnderflow(keys, children, fixIdx, childType, atKey) {
     const leftIdx = fixIdx - 1;
     const rightIdx = fixIdx + 1;
     const left = leftIdx >= 0 ? this.get(children[leftIdx]) : null;
@@ -160,16 +171,28 @@ class Writer {
     const canLend = (p) => p && p.type === childType && pageKeyCount(p) >= lendThreshold;
 
     if (canLend(left)) {
-      return this.borrowSide(keys, children, fixIdx, leftIdx, 'left', childType);
+      const r = this.borrowSide(keys, children, fixIdx, leftIdx, 'left', childType);
+      this.ev(childType === 'leaf' ? 'leaf-borrow' : 'internal-borrow',
+        { atKey, from: 'left', sepKey: r.keys[fixIdx - 1] });
+      return r;
     }
     if (canLend(right)) {
-      return this.borrowSide(keys, children, fixIdx, rightIdx, 'right', childType);
+      const r = this.borrowSide(keys, children, fixIdx, rightIdx, 'right', childType);
+      this.ev(childType === 'leaf' ? 'leaf-borrow' : 'internal-borrow',
+        { atKey, from: 'right', sepKey: r.keys[fixIdx] });
+      return r;
     }
     if (left && left.type === childType) {
-      return this.mergeSide(keys, children, fixIdx, leftIdx, 'left', childType);
+      const r = this.mergeSide(keys, children, fixIdx, leftIdx, 'left', childType);
+      this.ev(childType === 'leaf' ? 'leaf-merge' : 'internal-merge',
+        { atKey, with: 'left', mergedId: r.children[fixIdx - 1] });
+      return r;
     }
     if (right && right.type === childType) {
-      return this.mergeSide(keys, children, fixIdx, rightIdx, 'right', childType);
+      const r = this.mergeSide(keys, children, fixIdx, rightIdx, 'right', childType);
+      this.ev(childType === 'leaf' ? 'leaf-merge' : 'internal-merge',
+        { atKey, with: 'right', mergedId: r.children[fixIdx] });
+      return r;
     }
     throw new Error('下溢修正失败：兄弟节点类型异常');
   }
@@ -303,21 +326,45 @@ export class RuleError extends Error {
 }
 
 // 对已发布快照应用一批编辑，返回新根与全部新版本页。
+// traces[i] 是第 i 项编辑引发的结构事件序列（可能为空 = 未发生分裂/借位/合并）。
+// steps 逐项记录应用结果；某项违反规则时 error 携带该 RuleError，steps 停在失败项，
+// 提交路径照旧抛出 error（整批拒绝、不产生任何写入），预演路径则用 steps 展示逐项结局。
 export function applyEdits(srcPages, rootId, gen, edits) {
   const w = new Writer(srcPages, gen);
   let cur = rootId;
-  for (const op of edits) {
-    if (op.op === 'insert') {
-      const r = w.insert(cur, op.key, op.value);
-      cur = typeof r === 'string' ? r : r.split ? topFromSplit(w, r) : r;
-    } else if (op.op === 'delete') {
-      const r = w.remove(cur, op.key, true);
-      cur = r.id;
-    } else if (op.op === 'update') {
-      cur = w.update(cur, op.key, op.value);
-    } else {
-      throw new RuleError('UNKNOWN_OP', `未知操作类型: ${op.op}`);
+  const traces = [];
+  const steps = [];
+  let error = null;
+  for (let i = 0; i < edits.length; i++) {
+    const op = edits[i];
+    const mark = w.trace.length;
+    try {
+      if (op.op === 'insert') {
+        const r = w.insert(cur, op.key, op.value);
+        if (typeof r === 'string') {
+          cur = r;
+        } else if (r.split) {
+          cur = topFromSplit(w, r);
+          w.ev('root-grow', { rootId: cur, sepKey: r.key });
+        } else {
+          cur = r;
+        }
+      } else if (op.op === 'delete') {
+        const r = w.remove(cur, op.key, true);
+        cur = r.id;
+      } else if (op.op === 'update') {
+        cur = w.update(cur, op.key, op.value);
+      } else {
+        throw new RuleError('UNKNOWN_OP', `未知操作类型: ${op.op}`);
+      }
+    } catch (e) {
+      if (!(e instanceof RuleError)) throw e;
+      error = e;
+      steps.push({ index: i, ok: false, code: e.code, reason: e.message, events: w.trace.slice(mark) });
+      break;
     }
+    steps.push({ index: i, ok: true, rootIdAfter: cur, events: w.trace.slice(mark) });
+    traces.push(w.trace.slice(mark));
   }
   // 仅保留从新根可达的新版本（丢弃分裂/合并过程中的瞬态页）
   const reachable = closure(w, cur);
@@ -325,7 +372,7 @@ export function applyEdits(srcPages, rootId, gen, edits) {
   for (const id of reachable) {
     if (w.out.has(id)) pages.set(id, w.out.get(id));
   }
-  return { rootId: cur, gen, pages };
+  return { rootId: cur, gen, pages, traces, steps, error };
 }
 
 function topFromSplit(w, r) {

@@ -207,3 +207,134 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .banner .banner-title { font-weight: 700; margin-right: 8px; }
 
 .empty-hint { color: var(--muted); font-size: 13px; padding: 8px 0; }
+
+/* 预演视图 */
+.mem-badge {
+  font-size: 11px;
+  font-weight: 600;
+  color: #ffe2b0;
+  background: #2c2110;
+  border: 1px solid #7a5a1e;
+  border-radius: 10px;
+  padding: 1px 9px;
+  margin-left: 8px;
+  vertical-align: middle;
+}
+.reh-status {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 9px 12px;
+  font-size: 13px;
+  margin-bottom: 12px;
+  background: #0d1322;
+}
+.reh-status.none { color: var(--muted); border-style: dashed; }
+.reh-status.fresh { border-color: #1e4a7a; background: #10233a; color: #cfe6ff; }
+.reh-status.rejected { border-color: #7a1e2a; background: #2c1015; color: #ffc3c3; }
+.reh-status.stale { border-color: #7a5a1e; background: #2c2110; color: #ffe2b0; }
+.reh-pill {
+  display: inline-block;
+  font-size: 11px;
+  font-weight: 700;
+  border-radius: 10px;
+  padding: 1px 10px;
+  margin-right: 8px;
+}
+.reh-pill.none { background: #1b2438; color: var(--muted); border: 1px solid var(--line); }
+.reh-pill.fresh { background: #1e4a7a; color: #e9f4ff; }
+.reh-pill.rejected { background: #7a1e2a; color: #ffd7d7; }
+.reh-pill.stale { background: #7a5a1e; color: #fff3da; }
+.reh-note { display: block; margin-top: 5px; font-size: 12px; opacity: .78; }
+
+.reh-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+@media (max-width: 1100px) { .reh-grid { grid-template-columns: 1fr; } }
+.reh-col {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.reh-col-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: #0c1120;
+  font-size: 11.5px;
+  color: var(--muted);
+  border-bottom: 1px solid var(--line);
+}
+.reh-col-head .tag { font-size: 10px; padding: 1px 8px; border-radius: 10px; }
+.reh-published { border-color: #1f5c45; }
+.reh-published .reh-col-head .tag { background: #14432f; color: #c9ffe9; }
+.reh-candidate { border-color: #1e4a7a; border-style: dashed; }
+.reh-candidate .reh-col-head .tag { background: var(--accent-dim); color: #cfe6ff; }
+.reh-body { padding: 10px; position: relative; }
+.reh-stamp {
+  position: absolute;
+  top: 8px; right: 10px;
+  z-index: 2;
+  font-size: 11px;
+  font-weight: 700;
+  color: #fff3da;
+  background: #7a5a1e;
+  border-radius: 10px;
+  padding: 2px 10px;
+}
+.reh-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.reh-metrics > div {
+  background: #0d1322;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 5px 8px;
+  display: flex;
+  flex-direction: column;
+}
+.reh-metrics span { font-size: 10.5px; color: var(--muted); }
+.reh-metrics b { font-family: var(--mono); font-size: 14px; }
+.reh-ok { color: var(--ok); }
+.reh-bad { color: var(--bad); }
+.reh-rootline { font-size: 11px; color: var(--muted); word-break: break-all; margin-bottom: 8px; }
+.reh-leaves.dim { opacity: .5; }
+.reh-leaves .leaf-block { font-size: 11px; }
+.reh-leaves .kv { padding: 4px 7px; min-width: 38px; }
+.reh-leaves .kv .k { font-size: 13px; }
+.reh-leaves .kv .v { font-size: 10px; max-width: 90px; }
+
+.reh-steps { display: flex; flex-direction: column; gap: 5px; margin-top: 4px; }
+.reh-step {
+  display: grid;
+  grid-template-columns: 34px 170px 1fr;
+  gap: 8px;
+  align-items: start;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 12.5px;
+  background: #0d1322;
+}
+.reh-step.bad { border-color: #5c1f2a; background: #241015; }
+.reh-step.skip { opacity: .6; }
+.reh-step-no { font-family: var(--mono); color: var(--muted); font-size: 11.5px; }
+.reh-step-edit { font-family: var(--mono); font-size: 11.5px; }
+.reh-step-out { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+.reh-step-good { color: var(--ok); font-weight: 700; }
+.reh-step-bad { color: var(--bad); font-weight: 700; }
+.reh-step-skip { color: var(--muted); font-size: 11.5px; }
+.reh-step-ok { color: var(--muted); font-size: 11.5px; }
+.reh-ev {
+  font-size: 11px;
+  color: var(--warn);
+  background: #2c2110;
+  border: 1px solid #7a5a1e;
+  border-radius: 4px;
+  padding: 0 7px;
+}
+.card h3 { margin-top: 12px; }

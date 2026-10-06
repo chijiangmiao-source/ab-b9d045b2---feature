@@ -510,3 +510,212 @@ test('结果视图包含根代次、可达页、有序叶序列与恢复结论',
   assert.deepEqual(snap.leafSequence.map((x) => x.key), [10, 20, 30, 40, 50, 60, 70]);
   for (const p of snap.pages) assert.match(p.digest, /^[0-9a-f]{16}$/);
 });
+
+// ---------- 六、预演：纯内存、零写入，与提交一致且随基准失效 ----------
+
+async function storeExport(store) {
+  return store.export();
+}
+
+test('预演：在内存中给出根代次、候选根、新增/不可达页与有序叶序列，且零写入', async () => {
+  const { store, engine } = await freshDb();
+  const before = await storeExport(store);
+  const rootBefore = engine.state.rootId;
+
+  const edits = [
+    { op: 'insert', key: 5, value: '五' },
+    { op: 'insert', key: 15, value: '十五' },
+    { op: 'insert', key: 25, value: '廿五' },
+    { op: 'update', key: 40, value: '四十-改' },
+    { op: 'delete', key: 70 },
+  ];
+  const r = await engine.rehearse(edits, 'reh-1');
+  assert.equal(r.kind, 'rehearsal');
+  assert.equal(r.ok, true);
+  assert.equal(r.willReplay, undefined);
+  // 依据的根代次与根指针被绑定记录
+  assert.equal(r.base.baseGen, 1);
+  assert.equal(r.base.baseRootId, rootBefore);
+  assert.equal(r.base.batchId, 'reh-1');
+  assert.deepEqual(r.base.normalizedEdits.map((e) => e.op + ':' + e.key),
+    ['insert:5', 'insert:15', 'insert:25', 'update:40', 'delete:70']);
+  // 候选代次与候选根摘要
+  assert.equal(r.candidateGen, 2);
+  assert.ok(r.candidateRootId && r.candidateRootId !== rootBefore);
+  assert.ok(r.addedPages >= 1, '分裂至少新增页');
+  assert.ok(r.unreachablePages >= 1, 'COW 使旧路径页不再可达');
+  assert.equal(r.addedKeyCount, 2, '插入 3 键删除 1 键 = 净增 2');
+  assert.deepEqual(r.candidateSummary.leafKeys, [5, 10, 15, 20, 25, 30, 40, 50, 60]);
+  assert.equal(r.candidateSummary.ordered, true);
+  assert.equal(r.candidateSummary.allKeysOnce, true);
+  assert.equal(r.candidateSummary.keyCount, 9);
+
+  // 逐项结果：5 项全部接纳，插入 5/15/25 至少引发一次分裂事件
+  assert.equal(r.steps.length, 5);
+  assert.ok(r.steps.every((s) => s.ok));
+  const allEvents = r.structural.flat();
+  assert.ok(allEvents.some((t) => t.includes('分裂')));
+  assert.ok(r.structural[3].length === 0, '更新不引发结构事件');
+
+  // 关键：预演绝不触碰 IndexedDB —— 根、回执、意图、页集合逐项不变
+  const after = await storeExport(store);
+  assert.deepEqual([...after.keys()].sort(), [...before.keys()].sort());
+  assert.deepEqual(after, before);
+  assert.equal(engine.state.rootId, rootBefore, '内存已发布根也不变');
+  assert.equal(await store.get('intent'), undefined);
+  assert.equal(await store.get('receipt:reh-1'), undefined);
+});
+
+test('预演与随后提交一致：基准未变时同一批次产生相同键序与页结构摘要（含候选根 id）', async () => {
+  const { engine } = await freshDb();
+  const edits = [
+    { op: 'insert', key: 5, value: '五' },
+    { op: 'insert', key: 55, value: '五五' },
+    { op: 'delete', key: 30 },
+  ];
+  const r = await engine.rehearse(edits, 'reh-commit');
+  assert.equal(r.ok, true);
+
+  const gate = engine.assessRehearsal(r, edits, 'reh-commit');
+  assert.deepEqual(gate, { valid: true });
+
+  const receipt = await engine.submitBatch(edits, 'reh-commit');
+  assert.equal(receipt.status, 'committed');
+  const snap = engine.snapshot();
+  // 内容寻址：候选根 id 与实际提交根完全一致
+  assert.equal(receipt.rootId, r.candidateRootId);
+  assert.equal(snap.rootId, r.candidateRootId);
+  assert.equal(snap.gen, r.candidateGen);
+  assert.deepEqual(snap.leafSequence.map((x) => x.key), r.candidateSummary.leafKeys);
+  assert.equal(snap.reachablePages, r.candidateSummary.reachablePages);
+  assert.equal(snap.internalCount, r.candidateSummary.internalCount);
+  assert.equal(snap.leafCount, r.candidateSummary.leafCount);
+  assert.deepEqual(
+    snap.pages.map((p) => p.id).sort(),
+    r.candidateSnapshot.pages.map((p) => p.id).sort(),
+  );
+});
+
+test('预演后根指针变化：门禁要求重新预演（BASE_ROOT_MOVED），旧候选不可提交', async () => {
+  const { engine } = await freshDb();
+  const r = await engine.rehearse([{ op: 'insert', key: 5, value: '五' }], 'reh-move');
+  // 另一个批次先提交，根代次前进
+  await engine.submitBatch([{ op: 'insert', key: 9, value: '九' }], 'other-first');
+  const gate = engine.assessRehearsal(r, [{ op: 'insert', key: 5, value: '五' }], 'reh-move');
+  assert.equal(gate.valid, false);
+  assert.equal(gate.reasonCode, 'BASE_ROOT_MOVED');
+  assert.match(gate.reason, /重新预演/);
+});
+
+test('预演后脚本或批次标识变化：门禁判定 SCRIPT_CHANGED', async () => {
+  const { engine } = await freshDb();
+  const edits = [{ op: 'insert', key: 5, value: '五' }];
+  const r = await engine.rehearse(edits, 'reh-edit');
+  assert.equal(engine.assessRehearsal(r, [{ op: 'insert', key: 6, value: '六' }], 'reh-edit').reasonCode,
+    'SCRIPT_CHANGED');
+  assert.equal(engine.assessRehearsal(r, [{ op: 'insert', key: 5, value: '改' }], 'reh-edit').reasonCode,
+    'SCRIPT_CHANGED');
+  assert.equal(engine.assessRehearsal(r, edits, 'reh-edit-renamed').reasonCode,
+    'SCRIPT_CHANGED');
+  assert.equal(engine.assessRehearsal(null, edits, 'reh-edit').reasonCode, 'NO_REHEARSAL');
+});
+
+test('预演沿用提交中文拒因：重复插入 / 删除不存在 / 更新不存在，且无写入', async () => {
+  const { store, engine } = await freshDb();
+  const before = await storeExport(store);
+
+  const dup = await engine.rehearse([{ op: 'insert', key: 30, value: 'x' }], 'reh-dup');
+  assert.equal(dup.ok, false);
+  assert.equal(dup.code, 'INSERT_EXISTS');
+  assert.match(dup.reason, /已存在/);
+
+  const del = await engine.rehearse([{ op: 'delete', key: 999 }], 'reh-del');
+  assert.equal(del.code, 'DELETE_MISSING');
+  assert.match(del.reason, /不存在/);
+
+  const upd = await engine.rehearse([{ op: 'update', key: 999, value: 'x' }], 'reh-upd');
+  assert.equal(upd.code, 'UPDATE_MISSING');
+
+  // 批次内顺序脚本：第一项接纳、第二项重复插入被精确拒绝，逐项结果停在失败项
+  const seq = await engine.rehearse([
+    { op: 'insert', key: 100, value: 'a' },
+    { op: 'insert', key: 100, value: 'b' },
+    { op: 'update', key: 100, value: 'c' },
+  ], 'reh-seq');
+  assert.equal(seq.ok, false);
+  assert.equal(seq.code, 'INSERT_EXISTS');
+  assert.equal(seq.steps.length, 2);
+  assert.equal(seq.steps[0].ok, true);
+  assert.equal(seq.steps[1].ok, false);
+  assert.equal(seq.steps[1].code, 'INSERT_EXISTS');
+  assert.match(seq.steps[1].reason, /已存在/);
+
+  // 整批前置校验失败：无逐项结果，拒因与提交一致
+  const badId = await engine.rehearse([{ op: 'insert', key: 1, value: 'x' }], '');
+  assert.equal(badId.ok, false);
+  assert.match(badId.reason, /批次标识/);
+  assert.equal(badId.steps.length, 0);
+
+  const after = await storeExport(store);
+  assert.deepEqual(after, before, '任何预演拒绝都不产生写入');
+  assert.equal(engine.state.gen, 1);
+});
+
+test('预演如实复刻回执判定：等价编辑将幂等回放；同标识不同内容即冲突拒绝', async () => {
+  const { engine } = await freshDb();
+  const edits = [{ op: 'insert', key: 88, value: '八十八' }];
+  await engine.submitBatch(edits, 'reh-replay');
+  const rootAfter = engine.state.rootId;
+
+  const replay = await engine.rehearse(edits, 'reh-replay');
+  assert.equal(replay.ok, true);
+  assert.equal(replay.willReplay, true);
+  assert.equal(replay.addedPages, 0);
+  assert.equal(replay.unreachablePages, 0);
+  assert.equal(replay.candidateRootId, rootAfter, '回放候选即当前已发布根');
+  // 门禁允许，提交确实回放
+  assert.equal(engine.assessRehearsal(replay, edits, 'reh-replay').valid, true);
+  const receipt = await engine.submitBatch(edits, 'reh-replay');
+  assert.equal(receipt.replayed, true);
+
+  const conflict = await engine.rehearse([{ op: 'insert', key: 99, value: '九十九' }], 'reh-replay');
+  assert.equal(conflict.ok, false);
+  assert.equal(conflict.code, 'CONFLICT_BATCH_CONTENT');
+  assert.match(conflict.reason, /不同内容/);
+});
+
+test('预演汇报删除引发的合并 / 借位 / 根收缩结构事件', async () => {
+  const store = new MemoryStore();
+  const engine = new Engine(store);
+  await engine.open();
+  await engine.initialize([[1, 'a'], [2, 'b'], [3, 'c'], [4, 'd']]);
+  // 4 键：根为内部页、两叶；删到 1 键应观察到叶合并与根收缩
+  const r = await engine.rehearse(
+    [4, 3, 2].map((k) => ({ op: 'delete', key: k })), 'reh-merge');
+  assert.equal(r.ok, true);
+  const events = r.structural.flat();
+  assert.ok(events.some((t) => t.includes('合并')), '应至少发生一次叶合并：' + events.join(' / '));
+  assert.ok(events.some((t) => t.includes('根收缩')), '应发生根收缩');
+  assert.deepEqual(r.candidateSummary.leafKeys, [1]);
+  // 预演不写页，随后真实提交结果与预演一致
+  await engine.submitBatch([4, 3, 2].map((k) => ({ op: 'delete', key: k })), 'reh-merge');
+  assert.deepEqual(engine.snapshot().leafSequence.map((x) => x.key), [1]);
+});
+
+test('预演在已发布根不健康时以 CORRUPT_DIGEST/BROKEN_REFERENCE 拒绝且不写页', async () => {
+  const { store, engine } = await freshDb();
+  const root = engine.state.rootId;
+  const page = await store.get('page:' + root);
+  const tampered = page.type === 'leaf'
+    ? { ...page, values: page.values.map(() => '损坏') }
+    : { ...page, keys: page.keys.map((k) => k + 100000) };
+  await store.put('page:' + root, tampered);
+
+  const e2 = new Engine(store);
+  await e2.open();
+  const r = await e2.rehearse([{ op: 'insert', key: 1, value: 'x' }], 'reh-corrupt');
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'CORRUPT_DIGEST');
+  assert.match(r.reason, /摘要/);
+  assert.equal((await store.get('root')).rootId, root);
+});

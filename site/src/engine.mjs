@@ -326,6 +326,7 @@ export class Engine {
     let result;
     try {
       result = applyEdits(this.state.pages, this.state.rootId, gen, edits);
+      if (result.error) throw result.error;
     } catch (e) {
       if (e instanceof RuleError) return rejectReceipt(batchId, editDigest, e.code, e.message);
       throw e;
@@ -384,6 +385,190 @@ export class Engine {
     const keep = closure(w, result.rootId);
     for (const id of [...all.keys()]) if (!keep.has(id)) all.delete(id);
     return all;
+  }
+
+  // ---- 预演：纯内存计算，绝不写页 / 不留意图 / 不产生回执 ----
+  //
+  // 预演绑定启动（或最近一次复核/提交）时的根指针与规范化脚本：
+  // 返回中同时记录 baseRootId / baseGen / editDigest / normalizedEdits，
+  // 调用方在提交前据此判断基准是否仍一致；页面在刷新、初始索引变更或任一编辑重新录入后
+  // 必须丢弃预演（由控制层失效），不得把旧候选当作可提交结果。
+  //
+  // 预演可以读取回执 / 意图（只读），以便在提交前如实复刻提交的第一道判定：
+  // 等价重传 -> “将幂等回放原回执”；同标识不同内容 -> CONFLICT_BATCH_CONTENT 拒因。
+  async rehearse(rawEdits, batchId) {
+    const editDigest = safeEditDigest(rawEdits);
+    // 与提交完全相同的同步校验，拒绝原因也沿用中文拒因
+    try {
+      validateRequest({ batchId, edits: rawEdits });
+    } catch (e) {
+      if (e instanceof RuleError) {
+        return { kind: 'rehearsal', ok: false, base: this.rehearsalBase(batchId, editDigest, rawEdits),
+          code: e.code, reason: e.message, steps: [] };
+      }
+      throw e;
+    }
+    const edits = canonicalEdits(rawEdits);
+    const base = this.rehearsalBase(batchId, editDigest, edits);
+
+    // 尚无已发布根：无法在其上推演批次（初始航点须先走建立索引）
+    if (this.state?.rootId == null) {
+      return { kind: 'rehearsal', ok: false, base, code: 'NOT_INITIALIZED',
+        reason: '索引尚未建立，请先录入初始航点并建立代次 1 根', steps: [] };
+    }
+
+    // 已发布树损坏时同样不允许预演（与提交同一道保护）
+    try {
+      this.verifyPublished();
+    } catch (e) {
+      return { kind: 'rehearsal', ok: false, base, code: e.code, reason: e.message, steps: [] };
+    }
+
+    const baseSnap = this.snapshot();
+
+    // 只读复刻提交的回执判定：同批次标识的终局回执优先于树推演
+    const prior = await this.store.get(K_RECEIPT(batchId));
+    if (prior) {
+      if (prior.editDigest !== editDigest) {
+        return {
+          kind: 'rehearsal', ok: false, base,
+          code: 'CONFLICT_BATCH_CONTENT',
+          reason: `批次标识 ${batchId} 已用于不同内容的编辑（原摘要 ${prior.editDigest}），拒绝改写历史`,
+          steps: [], baseSummary: summarize(baseSnap),
+        };
+      }
+      // 等价重传：提交将回放原回执、不再改根、代次不前进；候选视图即当前已发布视图
+      return {
+        kind: 'rehearsal', ok: true, base, willReplay: true,
+        replayStatus: prior.status,
+        candidateGen: this.state.gen,
+        candidateRootId: this.state.rootId,
+        nextKeys: [...(this.state.keySet ?? [])].sort((a, b) => a - b),
+        steps: edits.map((e, i) => ({ index: i, ok: true, replayed: true, events: [] })),
+        events: edits.map(() => []),
+        structural: edits.map(() => ['批次已提交过，将幂等回放原回执，不再应用编辑、根与代次不变']),
+        baseSummary: summarize(baseSnap),
+        candidateSummary: summarize(baseSnap),
+        candidateSnapshot: baseSnap,
+        addedPages: 0, unreachablePages: 0,
+        addedPageIds: [], unreachablePageIds: [],
+        addedKeyCount: 0,
+      };
+    }
+
+    // 只读复刻提交的意图判定：尚有别的批次悬而未决时，本批同样无法提交
+    const intent = await this.store.get(K_INTENT);
+    if (intent && intent.batchId !== batchId) {
+      return {
+        kind: 'rehearsal', ok: false, base,
+        code: 'OTHER_BATCH_PENDING',
+        reason: `尚有批次 ${intent.batchId} 未完成恢复判定，请先重开复核`,
+        steps: [], baseSummary: summarize(baseSnap),
+      };
+    }
+
+    const gen = this.state.gen + 1;
+
+    // 纯内存：applyEdits 只在给定快照上构造新页 Map，不写 store
+    const result = applyEdits(this.state.pages, this.state.rootId, gen, edits);
+
+    // 规则违反（重复插入 / 删除不存在 / 更新不存在）：给出与提交一致的中文拒因，
+    // 同时保留逐项结果，明确“此候选不可提交”
+    if (result.error) {
+      return {
+        kind: 'rehearsal', ok: false, base,
+        code: result.error.code, reason: result.error.message,
+        steps: result.steps,
+        baseSummary: summarize(baseSnap),
+      };
+    }
+
+    // 候选视图 = 旧未改页 + 新页（与提交后视图同构），只存在于内存 Map 中
+    const combined = new Map(this.state.pages);
+    for (const [id, p] of result.pages) combined.set(id, p);
+    const w = { get: (id) => combined.get(id) ?? null, out: new Map() };
+    const keep = closure(w, result.rootId);
+    for (const id of [...combined.keys()]) if (!keep.has(id)) combined.delete(id);
+
+    const nextKeys = [...keysAfter(this.state.keySet ?? new Set(), edits)].sort((a, b) => a - b);
+    const candidate = snapshotOf(combined, result.rootId, gen, null);
+    candidate.audit = auditKeys(candidate, new Set(nextKeys));
+
+    const oldReach = new Set();
+    {
+      const w0 = { get: (id) => this.state.pages.get(id) ?? null, out: new Map() };
+      for (const id of closure(w0, this.state.rootId)) oldReach.add(id);
+    }
+    const newReach = new Set();
+    {
+      const w1 = { get: (id) => combined.get(id) ?? null, out: new Map() };
+      for (const id of closure(w1, result.rootId)) newReach.add(id);
+    }
+    const addedIds = [...newReach].filter((id) => !oldReach.has(id)).sort();
+    const unreachableIds = [...oldReach].filter((id) => !newReach.has(id)).sort();
+    const addedKeyCount = nextKeys.length - (this.state.keySet?.size ?? 0);
+
+    return {
+      kind: 'rehearsal',
+      ok: true,
+      base,
+      candidateGen: gen,
+      candidateRootId: result.rootId,
+      nextKeys,
+      steps: result.steps,
+      events: result.traces,
+      baseSummary: summarize(baseSnap),
+      candidateSummary: summarize(candidate),
+      candidateSnapshot: candidate,
+      addedPages: addedIds.length,
+      unreachablePages: unreachableIds.length,
+      addedPageIds: addedIds,
+      unreachablePageIds: unreachableIds,
+      addedKeyCount,
+      // 供页面展示结构事件中文描述
+      structural: describeEvents(result.traces),
+    };
+  }
+
+  rehearsalBase(batchId, editDigest, edits) {
+    let normalized = [];
+    try { normalized = Array.isArray(edits) ? canonicalEdits(edits) : []; } catch { normalized = []; }
+    return {
+      batchId: typeof batchId === 'string' ? batchId : '',
+      baseRootId: this.state?.rootId ?? null,
+      baseGen: this.state?.gen ?? 0,
+      editDigest,
+      normalizedEdits: normalized,
+    };
+  }
+
+  // 提交前对照预演基准：根指针或规范化脚本任一变化都判定基准漂移，必须重新预演
+  assessRehearsal(rehearsal, rawEdits, batchId) {
+    if (!rehearsal || rehearsal.kind !== 'rehearsal') {
+      return { valid: false, reasonCode: 'NO_REHEARSAL', reason: '尚无预演结果，请先执行预演' };
+    }
+    if (!rehearsal.ok) {
+      return { valid: false, reasonCode: 'REHEARSAL_REJECTED', reason: '预演已被拒绝（' + rehearsal.code + '），请修正脚本后重新预演' };
+    }
+    const b = rehearsal.base;
+    if (b.baseRootId !== (this.state?.rootId ?? null)) {
+      return { valid: false, reasonCode: 'BASE_ROOT_MOVED',
+        reason: `预演依据的根（代次 ${b.baseGen}）已变化，当前为代次 ${this.state?.gen ?? 0}；请重新预演后再提交` };
+    }
+    let digestNow;
+    try {
+      digestNow = safeEditDigest(rawEdits);
+    } catch {
+      digestNow = null;
+    }
+    let editsNow = [];
+    try { editsNow = canonicalEdits(rawEdits); } catch { editsNow = []; }
+    if (digestNow !== b.editDigest || JSON.stringify(editsNow) !== JSON.stringify(b.normalizedEdits)
+      || (typeof batchId === 'string' ? batchId.trim() : '') !== b.batchId) {
+      return { valid: false, reasonCode: 'SCRIPT_CHANGED',
+        reason: '批次标识或脚本在预演后发生变化，请重新预演后再提交' };
+    }
+    return { valid: true };
   }
 
   lookup(key) {
@@ -499,3 +684,46 @@ export function auditKeys(snapshot, expectedKeys) {
 }
 
 export { RuleError, ORDER };
+
+// ---- 预演辅助：结构摘要与事件中文描述 ----
+
+// 页结构摘要：根指针 id、代次、可达页、内部/叶页数、键总数与有序叶键序
+function summarize(snap) {
+  return {
+    rootId: snap.rootId,
+    gen: snap.gen,
+    reachablePages: snap.reachablePages,
+    internalCount: snap.internalCount,
+    leafCount: snap.leafCount,
+    keyCount: snap.keyCount,
+    ordered: snap.ordered,
+    allKeysOnce: snap.allKeysOnce,
+    leafKeys: snap.leafSequence.map((x) => x.key),
+    leafPageIds: (() => {
+      const ids = [];
+      for (const x of snap.leafSequence) {
+        if (ids[ids.length - 1] !== x.pageId) ids.push(x.pageId);
+      }
+      return ids;
+    })(),
+  };
+}
+
+const EVENT_TEXT = {
+  'leaf-split': (d) => `叶页在键 ${d.atKey} 处分裂，分隔键 ${d.sepKey} 上提`,
+  'internal-split': (d) => `内部页在键 ${d.atKey} 处分裂，提升分隔键 ${d.sepKey}`,
+  'root-grow': (d) => `根提升为新内部页，分隔键 ${d.sepKey}`,
+  'root-shrink': (d) => `删除键 ${d.atKey} 后根收缩为唯一子页`,
+  'leaf-borrow': (d) => `删除键 ${d.atKey} 后叶页下溢，向${d.from === 'left' ? '左' : '右'}邻借位（新分隔键 ${d.sepKey}）`,
+  'internal-borrow': (d) => `删除键 ${d.atKey} 后内部页下溢，向${d.from === 'left' ? '左' : '右'}邻借位（新分隔键 ${d.sepKey}）`,
+  'leaf-merge': (d) => `删除键 ${d.atKey} 后叶页与${d.with === 'left' ? '左' : '右'}邻合并`,
+  'internal-merge': (d) => `删除键 ${d.atKey} 后内部页与${d.with === 'left' ? '左' : '右'}邻合并`,
+};
+
+// 把每项编辑的事件数组转为中文说明；structural[i] 对应第 i 项编辑
+function describeEvents(traces) {
+  return traces.map((events) => events.map((e) => {
+    const f = EVENT_TEXT[e.kind];
+    return f ? f(e) : e.kind;
+  }));
+}

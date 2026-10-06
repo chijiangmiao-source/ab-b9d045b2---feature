@@ -57,6 +57,7 @@
         </label>
         <div class="row wrap">
           <button id="btn-submit" class="primary">提交批次</button>
+          <button id="btn-rehearse">🔍 预演（仅内存）</button>
           <button id="btn-reopen">⏻ 断电后重开复核</button>
           <button id="btn-lookup" class="ghost">按键查询</button>
           <input id="lookup-key" type="number" placeholder="查询键" class="small-input" />
@@ -84,6 +85,28 @@
           <div class="badge" id="r-once-badge"><span class="badge-label">每键恰好一次</span><strong>—</strong></div>
         </div>
         <div class="rootline">当前根指针：<code id="r-rootid">—</code></div>
+      </section>
+
+      <section class="card" id="rehearse-card">
+        <h2>预演视图 · 与已发布视图并列 <span class="mem-badge">仅内存计算</span></h2>
+        <p class="hint">
+          预演依据<b>启动时的根指针</b>与<b>规范化脚本</b>在内存中推演，<strong>不写入任何页、不留意图、不产生回执</strong>；
+          刷新页面、初始索引变更或重新录入任一编辑后立即失效，重开页面不会把候选误认为真实批次。
+          基准仍一致时提交同一批次，键序与页结构摘要必与预演相同；根已变化时须先重新预演。
+        </p>
+        <div id="rehearse-status" class="reh-status"></div>
+        <div class="reh-grid">
+          <div class="reh-col reh-published">
+            <div class="reh-col-head"><span class="tag">已发布视图</span><span>IndexedDB 根指针可达</span></div>
+            <div id="rh-pub" class="reh-body"></div>
+          </div>
+          <div class="reh-col reh-candidate">
+            <div class="reh-col-head"><span class="tag">预演候选</span><span>只存在于本页内存</span></div>
+            <div id="rh-cand" class="reh-body"></div>
+          </div>
+        </div>
+        <h3>每项编辑后的结果</h3>
+        <div id="rehearse-steps" class="reh-steps"></div>
       </section>
 
       <section class="card">

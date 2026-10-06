@@ -133,7 +133,7 @@ globalThis.location = { reload: () => reloads.push(1) };
 installFakeIndexedDB();
 const indexeddb = globalThis.indexedDB;
 
-test('页面启动为空库，录入 + 分裂批次 + 各事件路径无运行时错误', async () => {
+test('页面启动为空库，录入 + 预演 + 分裂批次 + 各事件路径无运行时错误', async () => {
   // app.mjs 在导入时即 boot()
   const { Engine } = await import('../site/src/engine.mjs');
   await import('../site/app.mjs');
@@ -161,27 +161,71 @@ test('页面启动为空库，录入 + 分裂批次 + 各事件路径无运行�
   tr.querySelector('.inp-key').value = '5';
   tr.querySelector('.inp-value').value = '五';
   byId('batch-id').value = 'ui-batch';
+
+  // 未预演直接提交：门禁拒绝，要求先预演
+  await Promise.all(byId('btn-submit').dispatch('click'));
+  let rcpt = JSON.parse(byId('receipt-out').textContent);
+  assert.equal(rcpt.status, 'rejected');
+  assert.equal(rcpt.requiresRehearsal, true);
+  assert.match(rcpt.code, /NO_REHEARSAL/);
+  assert.equal(byId('r-gen').textContent, '1', '门禁拒绝不改变根');
+
+  // 预演：仅内存，展示基准代次、候选代次、新增/不可达页、逐项接纳
+  await Promise.all(byId('btn-rehearse').dispatch('click'));
+  await new Promise((r) => setTimeout(r, 10));
+  rcpt = JSON.parse(byId('receipt-out').textContent);
+  assert.equal(rcpt.status, 'rehearsed');
+  assert.equal(rcpt.inMemoryOnly, true);
+  assert.equal(rcpt.baseGen, 1);
+  assert.equal(rcpt.candidateGen, 2);
+  assert.match(byId('rehearse-status').innerHTML, /预演有效 · 仅内存/);
+  assert.match(byId('rehearse-status').innerHTML, /没有写入页、意图或回执/);
+  assert.match(byId('rh-cand').innerHTML, /根代次/);
+  assert.match(byId('rh-pub').innerHTML, /根代次/);
+  assert.match(byId('rehearse-steps').innerHTML, /接纳/);
+  // 已发布视图仍停在代次 1（预演不写页）
+  assert.equal(byId('r-gen').textContent, '1');
+
+  // 预演后改动脚本 -> 预演明确失效；此时提交被门禁拒绝
+  tr.querySelector('.inp-key').dispatch('input', { target: tr.querySelector('.inp-key') });
+  assert.match(byId('rehearse-status').innerHTML, /预演已失效 · 不可提交/);
+  await Promise.all(byId('btn-submit').dispatch('click'));
+  rcpt = JSON.parse(byId('receipt-out').textContent);
+  assert.equal(rcpt.status, 'rejected');
+  assert.match(rcpt.code, /NO_REHEARSAL|SCRIPT_CHANGED/);
+
+  // 基准重新一致（内容未变、仅触发了一次 input）：重新预演后提交 -> 正常落根到代次 2
+  await Promise.all(byId('btn-rehearse').dispatch('click'));
   await Promise.all(byId('btn-submit').dispatch('click'));
   await new Promise((r) => setTimeout(r, 10));
-  assert.equal(byId('r-gen').textContent, '2');
-  assert.match(byId('audit-out').innerHTML, /期望 8 键/);
   assert.match(JSON.parse(byId('receipt-out').textContent).status, /committed/);
+  assert.equal(byId('r-gen').textContent, '2');
 
-  // 冲突重传：内容不同
+  // 冲突重传：内容不同。预演在内存中即给出与提交一致的 CONFLICT_BATCH_CONTENT 拒因
   tr.querySelector('.inp-key').value = '99';
   tr.querySelector('.inp-value').value = '九九';
+  await Promise.all(byId('btn-rehearse').dispatch('click'));
+  assert.match(byId('rehearse-status').innerHTML, /预演被拒绝/);
+  assert.match(byId('rehearse-status').innerHTML, /CONFLICT_BATCH_CONTENT/);
   await Promise.all(byId('btn-submit').dispatch('click'));
   await new Promise((r) => setTimeout(r, 10));
   const rej = JSON.parse(byId('receipt-out').textContent);
   assert.equal(rej.code, 'CONFLICT_BATCH_CONTENT');
   assert.equal(byId('r-gen').textContent, '2');
 
-  // 等价重传：回放原回执
+  // 等价重传：改回原脚本（真实输入会令旧预演失效），未重新预演前提交被门禁拦下
   tr.querySelector('.inp-key').value = '5';
   tr.querySelector('.inp-value').value = '五';
+  tr.querySelector('.inp-key').dispatch('input');
+  await Promise.all(byId('btn-submit').dispatch('click'));
+  assert.match(JSON.parse(byId('receipt-out').textContent).code, /NO_REHEARSAL|SCRIPT_CHANGED/);
+  // 重新预演：识别为等价编辑 -> 将幂等回放；提交回放原回执
+  await Promise.all(byId('btn-rehearse').dispatch('click'));
+  assert.match(byId('rehearse-status').innerHTML, /将幂等回放/);
   await Promise.all(byId('btn-submit').dispatch('click'));
   await new Promise((r) => setTimeout(r, 10));
   assert.equal(JSON.parse(byId('receipt-out').textContent).replayed, true);
+  assert.equal(byId('r-gen').textContent, '2', '回放不前进代次');
 
   // 查询
   byId('lookup-key').value = '5';
@@ -191,20 +235,26 @@ test('页面启动为空库，录入 + 分裂批次 + 各事件路径无运行�
   byId('btn-lookup').dispatch('click');
   assert.equal(JSON.parse(byId('receipt-out').textContent).found, false);
 
-  // 断电演练（after-intent）+ 重开复核
+  // 断电演练（after-intent）：先预演同一脚本再提交中断
   byId('crash-point').value = 'after-intent';
   tr.querySelector('.inp-key').value = '77';
   tr.querySelector('.inp-value').value = '七十七';
   byId('batch-id').value = 'ui-crash';
+  await Promise.all(byId('btn-rehearse').dispatch('click'));
+  assert.match(byId('rehearse-status').innerHTML, /预演有效/);
   await Promise.all(byId('btn-submit').dispatch('click'));
   await new Promise((r) => setTimeout(r, 10));
   assert.match(banner.innerHTML, /模拟断电中断/);
   assert.equal(JSON.parse(byId('receipt-out').textContent).status, 'interrupted');
+  // 中断触碰了持久化，预演须明确失效
+  assert.match(byId('rehearse-status').innerHTML, /预演已失效/);
 
   await Promise.all(byId('btn-reopen').dispatch('click'));
   await new Promise((r) => setTimeout(r, 20));
   assert.match(banner.innerHTML, /发布完整新根/);
   assert.equal(byId('r-gen').textContent, '3');
+  // 重开复核后旧预演仍标示失效，旧候选不会被当作可提交结果
+  assert.match(byId('rehearse-status').innerHTML, /预演已失效/);
 
   // 抹库：confirm 已垫片为 true，deleteDatabase 后应触发 reload
   await Promise.all(byId('btn-reset').dispatch('click'));
