@@ -207,3 +207,106 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .banner .banner-title { font-weight: 700; margin-right: 8px; }
 
 .empty-hint { color: var(--muted); font-size: 13px; padding: 8px 0; }
+
+/* 预演面板 */
+.preview-card { border-color: #4a3a6e; }
+.pv-status {
+  border: 1px dashed #5a4a8a;
+  background: #1a1530;
+  color: #c9bde6;
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 12.5px;
+}
+.pv-status strong { color: #ffd9a8; }
+.pv-status.ok { border-color: #1f5c45; background: #0f211c; color: #b8f0d8; }
+.pv-status.ok strong { color: var(--warn); }
+.pv-status.stale { border-color: #7a5a1e; background: #2c2110; color: #ffe2b0; }
+.pv-basis {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 6px 16px;
+  margin: 10px 0;
+  padding: 10px 12px;
+  background: #0c1120;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.pv-basis-row { display: flex; align-items: center; gap: 8px; font-size: 12px; min-width: 0; }
+.pv-basis-row .pv-k { color: var(--muted); white-space: nowrap; }
+.pv-basis-row code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pv-compare {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.pv-stat {
+  background: #0d1322;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 7px 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.pv-stat-k { font-size: 11px; color: var(--muted); }
+.pv-stat strong { font-family: var(--mono); font-size: 14px; word-break: break-all; }
+.pv-stat code { font-size: 11px; word-break: break-all; }
+.pv-stat.delta-add strong { color: var(--ok); }
+.pv-stat.delta-del strong { color: var(--bad); }
+.pv-stat.ok-text strong { color: var(--ok); }
+.pv-stat.bad-text strong { color: var(--bad); }
+.chip.add-chip { color: var(--ok); border-color: #1f5c45; }
+.chip.del-chip { color: var(--bad); border-color: #5c1f2a; }
+.pv-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.pv-col { border: 1px solid var(--line); border-radius: 8px; padding: 10px; min-width: 0; }
+.pv-col h4 { margin: 0 0 8px; font-size: 12px; color: var(--muted); }
+.pv-col.cand { border-color: #4a3a6e; background: #161228; }
+.pv-col.pub { border-color: #1f4a3a; background: #0e1a17; }
+.pv-col .leafseq { max-height: 260px; overflow: auto; }
+.preview-card h4 { margin: 14px 0 6px; font-size: 12.5px; color: var(--muted); }
+.pv-steps { display: flex; flex-direction: column; gap: 6px; margin-bottom: 8px; }
+.step {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 10px;
+  background: #0c1120;
+  font-size: 12px;
+}
+.step.failed { border-color: #7a1e2a; background: #241015; }
+.step-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.step-idx { font-family: var(--mono); color: var(--muted); }
+.step-op { font-weight: 700; font-size: 12px; }
+.step-op.op-insert { color: var(--ok); }
+.step-op.op-update { color: var(--warn); }
+.step-op.op-delete { color: var(--bad); }
+.step-key { font-family: var(--mono); font-weight: 700; }
+.step-val { color: var(--muted); font-family: var(--mono); font-size: 11px; }
+.step-event {
+  font-size: 10.5px;
+  padding: 1px 8px;
+  border-radius: 10px;
+  background: var(--accent-dim);
+  color: #cfe6ff;
+  border: 1px solid #2b5c8a;
+}
+.step-event.none { background: transparent; color: var(--muted); border-color: var(--line); }
+.step-before, .step-after { color: var(--muted); margin-top: 2px; font-family: var(--mono); font-size: 11px; }
+.step-after { color: #b9c8e2; }
+.step-keys { color: #8db9ef; }
+.pv-reject, .pv-replay {
+  border: 1px solid #7a1e2a;
+  background: #241015;
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 4px;
+}
+.pv-replay { border-color: #1e4a7a; background: #10233a; }
+.pv-reject-title { font-weight: 700; color: #ffc3c3; margin-bottom: 4px; }
+.pv-replay .pv-reject-title { color: #cfe6ff; }
+.pv-reject-code { font-family: var(--mono); color: var(--bad); font-size: 12.5px; }
+.pv-reject-reason { font-size: 13px; color: #ffd9d9; }
+.pv-reject-meta { font-size: 11.5px; color: var(--muted); margin-top: 4px; }
+@media (max-width: 1100px) { .pv-cols { grid-template-columns: 1fr; } }

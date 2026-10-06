@@ -8,7 +8,7 @@
 //   意图存在但页缺失/损坏 -> 保留旧根，剔除未竟意图与孤儿页，给出原因
 
 import {
-  applyEdits, buildTree, closure, orderedLeaves, RuleError, ORDER,
+  applyEdits, buildTree, closure, orderedLeaves, planEdits, RuleError, ORDER,
 } from './bptree.mjs';
 import { fnv1a64, stableStringify, verifyDigest } from './digest.mjs';
 
@@ -386,6 +386,150 @@ export class Engine {
     return all;
   }
 
+  // 只读预演：在内存中推演顺序脚本的结构影响，绝不触碰存储
+  //（不写新页、不留意图、不切根、不写回执）。
+  // 预检门禁与拒因与 submitBatch 完全同源；planEdits 与提交共用同一套树算法。
+  async previewBatch(rawEdits, batchId) {
+    const editDigest = safeEditDigest(rawEdits);
+    // 规范化可能对异常输入抛错；预览回执仍需要一个基准描述
+    let edits;
+    try {
+      edits = canonicalEdits(rawEdits);
+    } catch {
+      edits = [];
+    }
+    try {
+      validateRequest({ batchId, edits: rawEdits });
+    } catch (e) {
+      if (e instanceof RuleError) {
+        return {
+          ...rejectReceipt(batchId, editDigest, e.code, e.message),
+          preview: true, basis: this.previewBasis(editDigest, edits),
+        };
+      }
+      throw e;
+    }
+
+    const basis = this.previewBasis(editDigest, edits);
+
+    // 与提交一致的重传 / 冲突判定（只读）
+    const prior = await this.store.get(K_RECEIPT(batchId));
+    if (prior) {
+      if (prior.editDigest !== editDigest) {
+        return {
+          ...rejectReceipt(batchId, editDigest, 'CONFLICT_BATCH_CONTENT',
+            `批次标识 ${batchId} 已用于不同内容的编辑（原摘要 ${prior.editDigest}），拒绝改写历史`),
+          preview: true, basis,
+        };
+      }
+      // 等价重传：正式提交只会回放原回执，结构上不再有任何变化
+      return {
+        status: 'preview-replay', preview: true, batchId, editDigest,
+        receipt: { ...prior, replayed: true },
+        basis,
+        note: `批次标识 ${batchId} 已有等价终局回执，提交将回放原回执，不写页、不前进代次`,
+      };
+    }
+
+    // 已发布树损坏保护：与提交相同的冻结门禁
+    try {
+      this.verifyPublished();
+    } catch (e) {
+      return { ...rejectReceipt(batchId, editDigest, e.code, e.message), preview: true, basis };
+    }
+
+    const intent = await this.store.get(K_INTENT);
+    if (intent && intent.batchId !== batchId) {
+      return {
+        ...rejectReceipt(batchId, editDigest, 'OTHER_BATCH_PENDING',
+          `尚有批次 ${intent.batchId} 未完成恢复判定，请先重开复核`),
+        preview: true, basis,
+      };
+    }
+
+    const basisGen = this.state.gen;
+    const basisRootId = this.state.rootId;
+    const gen = basisGen + 1;
+    let plan;
+    try {
+      plan = planEdits(this.state.pages, basisRootId, gen, edits);
+    } catch (e) {
+      if (e instanceof RuleError) {
+        return {
+          ...rejectReceipt(batchId, editDigest, e.code, e.message),
+          preview: true, failedAt: e.stepIndex ?? null, steps: e.steps ?? [], basis,
+        };
+      }
+      throw e;
+    }
+
+    const nextKeys = [...keysAfter(this.state.keySet ?? new Set(), edits)].sort((a, b) => a - b);
+    const combined = this.allPagesAfter(plan);
+    const snap = snapshotOf(combined, plan.rootId, gen, null);
+    snap.audit = auditKeys(snap, new Set(nextKeys));
+
+    const oldW = { get: (id) => this.state.pages.get(id) ?? null, out: new Map() };
+    const oldReachable = closure(oldW, basisRootId);
+    const newW = { get: (id) => combined.get(id) ?? null, out: new Map() };
+    const newReachable = closure(newW, plan.rootId);
+    const addedPageIds = [...plan.pages.keys()];
+    const unreachablePageIds = [...oldReachable].filter((id) => !newReachable.has(id));
+
+    const oldKeys = snap0Keys(this.state.pages, basisRootId);
+    const newKeySet = new Set(nextKeys);
+    const oldKeySet = new Set(oldKeys);
+
+    return {
+      status: 'preview',
+      preview: true,
+      batchId,
+      editDigest,
+      basis,
+      candidate: {
+        gen,
+        rootId: plan.rootId,
+        reachablePages: snap.reachablePages,
+        internalCount: snap.internalCount,
+        leafCount: snap.leafCount,
+        keyCount: snap.keyCount,
+        addedPages: addedPageIds.length,
+        addedPageIds,
+        unreachablePages: unreachablePageIds.length,
+        unreachablePageIds,
+        addedKeys: nextKeys.filter((k) => !oldKeySet.has(k)),
+        removedKeys: oldKeys.filter((k) => !newKeySet.has(k)),
+        ordered: snap.ordered,
+        allKeysOnce: snap.allKeysOnce,
+        audit: snap.audit,
+        leafSequence: snap.leafSequence,
+        pages: snap.pages,
+      },
+      steps: plan.steps,
+      note: '预演仅在内存中计算：未写入任何页、未留下意图、未固化回执，刷新后即消失',
+      previewAt: this.now(),
+    };
+  }
+
+  previewBasis(editDigest, edits) {
+    const rootId = this.state?.rootId ?? null;
+    const gen = this.state?.gen ?? 0;
+    const pages = this.state?.pages ?? new Map();
+    return {
+      rootId,
+      gen,
+      editDigest,
+      edits: edits.map((e) => ({ ...e })),
+      keyCount: rootId ? snap0Keys(pages, rootId).length : 0,
+      at: this.now(),
+    };
+  }
+
+  // 预演是否仍绑定当前已发布根（根指针一旦变化即失效）
+  previewMatchesBasis(basis) {
+    if (!basis || !this.state) return false;
+    return basis.rootId === this.state.rootId && basis.gen === this.state.gen;
+  }
+
   lookup(key) {
     let id = this.state.rootId;
     while (id) {
@@ -499,3 +643,9 @@ export function auditKeys(snapshot, expectedKeys) {
 }
 
 export { RuleError, ORDER };
+
+// 取某个根沿树结构中序遍历所得键序（预演对比旧根用）
+function snap0Keys(pages, rootId) {
+  if (!rootId) return [];
+  return orderedLeaves(pages, rootId).flatMap((p) => p.keys);
+}

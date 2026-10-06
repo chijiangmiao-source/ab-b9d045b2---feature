@@ -303,21 +303,43 @@ export class RuleError extends Error {
 }
 
 // 对已发布快照应用一批编辑，返回新根与全部新版本页。
+// 预演与正式提交共用同一个 planEdits，保证“基准一致时预演结果 == 提交结果”。
 export function applyEdits(srcPages, rootId, gen, edits) {
+  const { rootId: rid, gen: g, pages } = planEdits(srcPages, rootId, gen, edits);
+  return { rootId: rid, gen: g, pages };
+}
+
+// 顺序脚本的内存推演：除最终结果外，逐项记录每步编辑后的键序、页计数与结构事件。
+// 规则违反时抛 RuleError，并附带 stepIndex（1 起）与已完成步骤 steps，错误原因与提交完全同源。
+export function planEdits(srcPages, rootId, gen, edits) {
   const w = new Writer(srcPages, gen);
   let cur = rootId;
-  for (const op of edits) {
-    if (op.op === 'insert') {
-      const r = w.insert(cur, op.key, op.value);
-      cur = typeof r === 'string' ? r : r.split ? topFromSplit(w, r) : r;
-    } else if (op.op === 'delete') {
-      const r = w.remove(cur, op.key, true);
-      cur = r.id;
-    } else if (op.op === 'update') {
-      cur = w.update(cur, op.key, op.value);
-    } else {
-      throw new RuleError('UNKNOWN_OP', `未知操作类型: ${op.op}`);
+  const steps = [];
+  for (let i = 0; i < edits.length; i++) {
+    const op = edits[i];
+    const before = viewAt(w, cur);
+    const emittedBefore = new Set(w.out.keys());
+    try {
+      if (op.op === 'insert') {
+        const r = w.insert(cur, op.key, op.value);
+        cur = typeof r === 'string' ? r : r.split ? topFromSplit(w, r) : r;
+      } else if (op.op === 'delete') {
+        const r = w.remove(cur, op.key, true);
+        cur = r.id;
+      } else if (op.op === 'update') {
+        cur = w.update(cur, op.key, op.value);
+      } else {
+        throw new RuleError('UNKNOWN_OP', `未知操作类型: ${op.op}`);
+      }
+    } catch (e) {
+      if (e instanceof RuleError) { e.stepIndex = i + 1; e.steps = steps; }
+      throw e;
     }
+    const after = viewAt(w, cur);
+    // 仅统计本步新写且在该步结束后仍从根可达的页（分裂瞬态页不计）
+    const emittedPageIds = [...w.out.keys()]
+      .filter((id) => !emittedBefore.has(id) && after.pageIds.has(id));
+    steps.push(stepView(i + 1, op, before, after, emittedPageIds));
   }
   // 仅保留从新根可达的新版本（丢弃分裂/合并过程中的瞬态页）
   const reachable = closure(w, cur);
@@ -325,7 +347,65 @@ export function applyEdits(srcPages, rootId, gen, edits) {
   for (const id of reachable) {
     if (w.out.has(id)) pages.set(id, w.out.get(id));
   }
-  return { rootId: cur, gen, pages };
+  return { rootId: cur, gen, pages, steps };
+}
+
+// 某一步执行点的只读投影视图：沿当前根（src 旧页 + out 新页）闭合遍历
+function viewAt(w, rootId) {
+  const pageIds = closure(w, rootId);
+  const map = new Map();
+  for (const id of pageIds) map.set(id, w.get(id));
+  const leaves = orderedLeaves(map, rootId);
+  let internalCount = 0;
+  let height = 0;
+  const go = (id, depth) => {
+    const p = map.get(id);
+    height = Math.max(height, depth + 1);
+    if (p.type === 'internal') {
+      internalCount++;
+      for (const c of p.children) go(c, depth + 1);
+    }
+  };
+  go(rootId, 0);
+  return {
+    rootId,
+    pageIds,
+    leafCount: leaves.length,
+    internalCount,
+    height,
+    keys: leaves.flatMap((l) => l.keys),
+  };
+}
+
+// 结构事件标签（中文释义由展示层给出）：分裂 / 提升 / 合并 / 收缩 / 借位
+function stepView(index, op, before, after, emittedPageIds) {
+  const events = [];
+  if (op.op === 'insert') {
+    if (after.leafCount > before.leafCount) events.push('leaf-split');
+    if (after.height > before.height) events.push('root-promote');
+    else if (after.internalCount > before.internalCount) events.push('internal-split');
+  } else if (op.op === 'delete') {
+    if (after.leafCount < before.leafCount) events.push('leaf-merge');
+    if (after.height < before.height) events.push('root-shrink');
+    else if (after.internalCount < before.internalCount) events.push('internal-merge');
+    // 页计数不变但 COW 路径之外还多写了页 => 兄弟节点借位修正下溢
+    else if (emittedPageIds.length > before.height) events.push('borrow');
+  }
+  const slim = (v) => ({
+    rootId: v.rootId, keys: v.keys, leafCount: v.leafCount,
+    internalCount: v.internalCount, height: v.height,
+  });
+  return {
+    index,
+    op: {
+      op: op.op, key: op.key,
+      ...(op.value !== undefined ? { value: op.value } : {}),
+    },
+    before: slim(before),
+    after: slim(after),
+    events,
+    emittedPageIds,
+  };
 }
 
 function topFromSplit(w, r) {

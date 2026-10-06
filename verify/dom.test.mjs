@@ -121,6 +121,9 @@ function byId(id) {
   }
   return ids.get(id);
 }
+// 第二个用例重导 app.mjs 前清空元素缓存：旧模块的监听器仍挂在旧元素上，
+// 但新 boot 绑定的是全新元素，互不串扰。
+globalThis.__resetDomIds = () => ids.clear();
 
 globalThis.document = {
   getElementById: byId,
@@ -210,4 +213,183 @@ test('页面启动为空库，录入 + 分裂批次 + 各事件路径无运行�
   await Promise.all(byId('btn-reset').dispatch('click'));
   await new Promise((r) => setTimeout(r, 20));
   assert.equal(reloads.length, 1);
+});
+
+test('预演面板：只读预演、并列对照、逐项结果、编辑/提交后失效、拒因与重放', async () => {
+  installFakeIndexedDB();
+  globalThis.__resetDomIds();
+  // app.mjs 已导入且 boot 过一次；以查询串绕过模块缓存重跑 boot 到新的（已清空的）垫片库
+  await import('../site/app.mjs?fresh=' + Date.now());
+  await new Promise((r) => setTimeout(r, 20));
+
+  byId('init-input').value = '10,十\n20,廿\n30,卅';
+  byId('init-input').dispatch('input');
+  await Promise.all(byId('btn-init').dispatch('click'));
+  await new Promise((r) => setTimeout(r, 10));
+
+  // 未预演时按钮可用，结果区为引导文案
+  assert.equal(byId('btn-preview').disabled, false);
+  assert.match(byId('preview-status').innerHTML, /尚未预演/);
+
+  // 录入脚本：插入 5（单叶 3 键 -> 第 4 键触发叶分裂与根提升）+ 更新 20
+  byId('btn-add-edit').dispatch('click');
+  const tr = byId('edit-table').querySelectorAll('tbody tr')[0];
+  tr.querySelector('.sel-op').value = 'insert';
+  tr.querySelector('.inp-key').value = '5';
+  tr.querySelector('.inp-value').value = '五';
+  byId('btn-add-edit').dispatch('click');
+  const tr2 = byId('edit-table').querySelectorAll('tbody tr')[1];
+  tr2.querySelector('.sel-op').value = 'update';
+  tr2.querySelector('.inp-key').value = '20';
+  tr2.querySelector('.inp-value').value = '廿改';
+  byId('batch-id').value = 'ui-pv';
+
+  await Promise.all(byId('btn-preview').dispatch('click'));
+  await new Promise((r) => setTimeout(r, 10));
+
+  // 预演有效：根代次基准、候选摘要、新增/不可达、并列叶序、逐项结果
+  assert.match(byId('preview-status').innerHTML, /预演有效/);
+  assert.match(byId('preview-status').innerHTML, /没有写入页|没有留下意图|没有回执|内存/);
+  assert.match(byId('pv-basis').innerHTML, /所依据根代次/);
+  assert.match(byId('pv-basis').innerHTML, /规范化脚本摘要/);
+  assert.match(byId('pv-compare').innerHTML, /候选根代次/);
+  assert.match(byId('pv-compare').innerHTML, /预计新增页/);
+  assert.match(byId('pv-compare').innerHTML, /提交后不再可达页/);
+  assert.match(byId('pv-leafseq').innerHTML, /5/);
+  assert.match(byId('pv-pub-leafseq').innerHTML, /10/);
+  assert.match(byId('pv-steps').innerHTML, /#1/);
+  assert.match(byId('pv-steps').innerHTML, /#2/);
+  assert.match(byId('pv-steps').innerHTML, /叶分裂/);
+  assert.match(byId('pv-pages').innerHTML, /内部页|叶页/);
+
+  // 预演回执进入最近回执区，但不包含整棵候选树
+  const receipt = JSON.parse(byId('receipt-out').textContent);
+  assert.equal(receipt.status, 'preview');
+  assert.deepEqual(receipt.candidate.leafKeys, [5, 10, 20, 30]);
+  assert.match(receipt.note, /内存/);
+
+  // 已发布视图没有变化
+  assert.equal(byId('r-gen').textContent, '1');
+  assert.equal(byId('r-keys').textContent, '3');
+
+  // 重新录入任一编辑 -> 预演立即失效，且明确不能当作可提交结果
+  tr.querySelector('.inp-key').value = '6';
+  tr.querySelector('.inp-key').dispatch('input');
+  assert.match(byId('preview-status').innerHTML, /旧预演已失效/);
+  assert.match(byId('preview-status').innerHTML, /不可当作可提交结果/);
+  assert.equal(byId('preview-body').classList.contains('hidden'), true);
+
+  // 重新预演（脚本现为插 6 + 更新 20）后恢复有效
+  await Promise.all(byId('btn-preview').dispatch('click'));
+  await new Promise((r) => setTimeout(r, 10));
+  assert.match(byId('preview-status').innerHTML, /预演有效/);
+
+  // 基准一致时提交：成功，且提交后预演因根变化失效
+  await Promise.all(byId('btn-submit').dispatch('click'));
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(JSON.parse(byId('receipt-out').textContent).status, 'committed');
+  assert.equal(byId('r-gen').textContent, '2');
+  assert.match(byId('preview-status').innerHTML, /旧预演已失效/);
+  assert.match(byId('preview-status').innerHTML, /根指针已变化/);
+
+  // 拒因预演：重复插入已发布键 -> 中文拒因与提交同源
+  tr.querySelector('.inp-key').value = '6';
+  tr.querySelector('.sel-op').value = 'insert';
+  tr.querySelector('.inp-value').value = '又一个六';
+  tr2.querySelector('.sel-op').value = 'delete';
+  tr2.querySelector('.inp-key').value = '20';
+  byId('batch-id').value = 'ui-pv-reject';
+  await Promise.all(byId('btn-preview').dispatch('click'));
+  await new Promise((r) => setTimeout(r, 10));
+  assert.match(byId('pv-compare').innerHTML, /预演拒绝/);
+  assert.match(byId('pv-compare').innerHTML, /INSERT_EXISTS/);
+  assert.match(byId('pv-compare').innerHTML, /键 6 已存在/);
+  // 已发布对照仍在
+  assert.match(byId('pv-pub-leafseq').innerHTML, /叶 /);
+  // 被预演拒绝的脚本没有产生任何写入
+  assert.equal(byId('r-gen').textContent, '2');
+
+  // 等价重传预演：批次 ui-pv 已提交，脚本恢复为该批次原内容（插 6(五) + 更新 20）
+  tr.querySelector('.inp-key').value = '6';
+  tr.querySelector('.inp-value').value = '五';
+  tr2.querySelector('.sel-op').value = 'update';
+  tr2.querySelector('.inp-key').value = '20';
+  tr2.querySelector('.inp-value').value = '廿改';
+  byId('batch-id').value = 'ui-pv';
+  await Promise.all(byId('btn-preview').dispatch('click'));
+  await new Promise((r) => setTimeout(r, 10));
+  assert.match(byId('pv-compare').innerHTML, /等价终局回执/);
+  assert.match(JSON.parse(byId('receipt-out').textContent).status, /preview-replay/);
+});
+
+test('预演失效门禁：根被别的批次推动后，旧脚本提交必须先重新预演；幂等回放不受影响', async () => {
+  installFakeIndexedDB();
+  globalThis.__resetDomIds();
+  await import('../site/app.mjs?fresh2=' + Date.now());
+  await new Promise((r) => setTimeout(r, 20));
+
+  byId('init-input').value = '10,十\n20,廿\n30,卅';
+  byId('init-input').dispatch('input');
+  await Promise.all(byId('btn-init').dispatch('click'));
+  await new Promise((r) => setTimeout(r, 10));
+
+  const setRow = (sel, op, key, value) => {
+    sel.querySelector('.sel-op').value = op;
+    sel.querySelector('.inp-key').value = String(key);
+    sel.querySelector('.inp-value').value = value ?? '';
+  };
+
+  // 脚本 X：插入 5；先预演但不提交
+  byId('btn-add-edit').dispatch('click');
+  const tr = byId('edit-table').querySelectorAll('tbody tr')[0];
+  setRow(tr, 'insert', 5, '五');
+  byId('batch-id').value = 'batch-x';
+  await Promise.all(byId('btn-preview').dispatch('click'));
+  await new Promise((r) => setTimeout(r, 10));
+  assert.match(byId('preview-status').innerHTML, /预演有效/);
+
+  // 改录脚本 Y（另一批次，从未预演）直接提交：原有行为不变，允许进入引擎
+  setRow(tr, 'insert', 99, '九九');
+  byId('batch-id').value = 'batch-y';
+  await new Promise((r) => setTimeout(r, 0)); // 输入事件已令 X 预演失效
+  await Promise.all(byId('btn-submit').dispatch('click'));
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(JSON.parse(byId('receipt-out').textContent).status, 'committed');
+  assert.equal(byId('r-gen').textContent, '2');
+
+  // 录回脚本 X 并提交：此时 X 的预演基准（代次1根）已失效，必须先重新预演
+  setRow(tr, 'insert', 5, '五');
+  byId('batch-id').value = 'batch-x';
+  await Promise.all(byId('btn-submit').dispatch('click'));
+  await new Promise((r) => setTimeout(r, 10));
+  assert.match(byId('receipt-out').textContent, /根已变化/);
+  assert.equal(byId('r-gen').textContent, '2', '被拦截，根未前进');
+  assert.match(byId('preview-status').innerHTML, /旧预演已失效/);
+
+  // 重新预演后提交成功
+  await Promise.all(byId('btn-preview').dispatch('click'));
+  await new Promise((r) => setTimeout(r, 10));
+  assert.match(byId('preview-status').innerHTML, /预演有效/);
+  await Promise.all(byId('btn-submit').dispatch('click'));
+  await new Promise((r) => setTimeout(r, 10));
+  const receipt = JSON.parse(byId('receipt-out').textContent);
+  assert.equal(receipt.status, 'committed');
+  assert.equal(byId('r-gen').textContent, '3');
+
+  // 幂等回执：同批次等价重传无需再预演，直接回放，根不前进
+  await Promise.all(byId('btn-submit').dispatch('click'));
+  await new Promise((r) => setTimeout(r, 10));
+  const replay = JSON.parse(byId('receipt-out').textContent);
+  assert.equal(replay.status, 'committed');
+  assert.equal(replay.replayed, true);
+  assert.equal(byId('r-gen').textContent, '3');
+
+  // 未预演的新批次仍可直接提交（保持原有行为；拒因由引擎给）
+  setRow(tr, 'insert', 5, '重复');
+  byId('batch-id').value = 'batch-z-no-preview';
+  await Promise.all(byId('btn-submit').dispatch('click'));
+  await new Promise((r) => setTimeout(r, 10));
+  const rej = JSON.parse(byId('receipt-out').textContent);
+  assert.equal(rej.status, 'rejected');
+  assert.equal(rej.code, 'INSERT_EXISTS');
 });
